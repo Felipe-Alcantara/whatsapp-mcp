@@ -237,7 +237,8 @@ automatically.
 
 Delete messages from this WhatsApp account only (WhatsApp's "Delete for me").
 They disappear from the phone and every linked device and are removed from
-`messages.db`; the other participants keep their copies. It works for messages of
+`messages.db`, together with the media files the bridge downloaded for them;
+the other participants keep their copies. It works for messages of
 any sender and any age. This is not "delete for everyone" (revoking), which only
 applies to your own recent messages.
 
@@ -272,8 +273,9 @@ Failures carry a stable `error_code` (`invalid_selector`, `unknown_ids`,
 - Group messages from other participants are not supported yet (the mutation
   needs the sender in the exact form the phone uses); your own group messages
   and all direct-chat messages are.
-- Media files the bridge already downloaded to disk are not removed; only the
-  `messages.db` rows are.
+- Only media the bridge downloaded under `store/` is removed from disk, and
+  only for the messages being deleted. Copies you exported or saved elsewhere
+  are yours to remove.
 
 The bridge endpoint behind the tool is `POST /api/delete-for-me`
 (`{"chat_jid": "...", "message_ids": ["..."], "messages": [{"id": "...", "from_me": false}]}`,

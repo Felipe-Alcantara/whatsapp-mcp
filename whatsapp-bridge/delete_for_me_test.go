@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -351,6 +352,99 @@ func TestDeleteForMe_ResolveFailure_Returns400(t *testing.T) {
 
 	if resp.Code != http.StatusBadRequest || len(bridge.patches) != 0 || countMessages(t, ms, chat) != 1 {
 		t.Errorf("expected 400 with nothing sent or deleted, got %d", resp.Code)
+	}
+}
+
+func seedMediaMessage(t *testing.T, ms *MessageStore, id, chatJID, mediaType string, ts time.Time) {
+	t.Helper()
+	if _, err := ms.db.Exec(
+		`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type)
+		 VALUES (?, ?, '15551234567', '', ?, 0, ?)`,
+		id, chatJID, ts, mediaType,
+	); err != nil {
+		t.Fatalf("seed media message %s: %v", id, err)
+	}
+}
+
+func writeMediaFile(t *testing.T, chat, mediaType, id string, ts time.Time) string {
+	t.Helper()
+	chatDir, path, _, err := mediaDownloadStorePaths(chat, mediaType, id, ts)
+	if err != nil {
+		t.Fatalf("media path for %s: %v", id, err)
+	}
+	if err := os.MkdirAll(chatDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func TestDeleteForMe_RemovesOnlyTheDownloadedMediaOfDeletedMessages(t *testing.T) {
+	t.Chdir(t.TempDir()) // the bridge keeps media under ./store
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	ts := time.Unix(1760000000, 0)
+	seedMediaMessage(t, ms, "IMG1", chat, "image", ts)
+	seedMediaMessage(t, ms, "IMG_NEVER_DOWNLOADED", chat, "image", ts)
+	seedMediaMessage(t, ms, "IMG_KEPT", chat, "image", ts)
+	seedMessage(t, ms, "TXT1", chat, false, ts)
+	deleted := writeMediaFile(t, chat, "image", "IMG1", ts)
+	kept := writeMediaFile(t, chat, "image", "IMG_KEPT", ts)
+	bridge := connectedBridge()
+
+	resp := postJSON(t, deleteForMeHandler(bridge.deps(), ms), http.MethodPost,
+		`{"chat_jid":"`+chat+`","message_ids":["IMG1","IMG_NEVER_DOWNLOADED","TXT1"]}`, "")
+
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "3 message(s) deleted for me, 1 media file(s) removed") {
+		t.Fatalf("expected 200 reporting 1 media file removed, got %d (%s)", resp.Code, resp.Body.String())
+	}
+	if fileExists(deleted) {
+		t.Error("the downloaded file of a deleted message should be gone")
+	}
+	if !fileExists(kept) {
+		t.Error("the file of a message that was not deleted must stay")
+	}
+}
+
+func TestDeleteForMe_FailedPatchKeepsMedia(t *testing.T) {
+	t.Chdir(t.TempDir())
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	ts := time.Unix(1760000000, 0)
+	seedMediaMessage(t, ms, "IMG1", chat, "image", ts)
+	path := writeMediaFile(t, chat, "image", "IMG1", ts)
+	bridge := connectedBridge()
+	bridge.sendErr = errors.New("boom")
+
+	postJSON(t, deleteForMeHandler(bridge.deps(), ms), http.MethodPost, `{"chat_jid":"`+chat+`","message_ids":["IMG1"]}`, "")
+
+	if !fileExists(path) {
+		t.Error("media must survive a failed delete so the call can be retried")
+	}
+}
+
+func TestRemoveDownloadedMedia_IgnoresUnsafeIDsAndNonMedia(t *testing.T) {
+	t.Chdir(t.TempDir())
+	chat := "15551234567@s.whatsapp.net"
+	ts := time.Unix(1760000000, 0)
+	sentinel := writeMediaFile(t, chat, "image", "SENTINEL", ts)
+
+	removed := removeDownloadedMedia(chat, []storedMessageRef{
+		{ID: "../escape", Timestamp: ts, MediaType: "image"},
+		{ID: `a\b`, Timestamp: ts, MediaType: "image"},
+		{ID: "REACT1", Timestamp: ts, MediaType: "reaction"},
+		{ID: "TXT1", Timestamp: ts},
+	})
+
+	if removed != 0 || !fileExists(sentinel) {
+		t.Errorf("nothing may be removed for unsafe IDs or non-media rows, removed=%d", removed)
 	}
 }
 

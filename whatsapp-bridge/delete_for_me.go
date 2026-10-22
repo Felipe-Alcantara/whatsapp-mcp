@@ -18,8 +18,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -54,10 +57,12 @@ type DeleteForMeRequest struct {
 }
 
 // storedMessageRef is what an app state patch needs to address a message.
+// MediaType is only known for stored messages and locates the downloaded file.
 type storedMessageRef struct {
 	ID        string
 	Timestamp time.Time
 	FromMe    bool
+	MediaType string
 }
 
 // GetMessageRefs returns the stored messages among ids in chatJID, keyed by ID.
@@ -75,7 +80,7 @@ func (store *MessageStore) GetMessageRefs(chatJID string, ids []string) (map[str
 		args = append(args, id)
 	}
 	rows, err := store.db.Query(
-		`SELECT id, timestamp, is_from_me FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)`,
+		`SELECT id, timestamp, is_from_me, COALESCE(media_type, '') FROM messages WHERE chat_jid = ? AND id IN (`+strings.Join(placeholders, ",")+`)`,
 		args...,
 	)
 	if err != nil {
@@ -83,17 +88,17 @@ func (store *MessageStore) GetMessageRefs(chatJID string, ids []string) (map[str
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
-		var id string
+		var id, mediaType string
 		var rawTimestamp any
 		var fromMe bool
-		if err := rows.Scan(&id, &rawTimestamp, &fromMe); err != nil {
+		if err := rows.Scan(&id, &rawTimestamp, &fromMe, &mediaType); err != nil {
 			return nil, err
 		}
 		ts := anchorTime(rawTimestamp)
 		if ts.IsZero() {
 			return nil, fmt.Errorf("message %q has an unreadable timestamp %v", id, rawTimestamp)
 		}
-		refs[id] = storedMessageRef{ID: id, Timestamp: ts, FromMe: fromMe}
+		refs[id] = storedMessageRef{ID: id, Timestamp: ts, FromMe: fromMe, MediaType: mediaType}
 	}
 	return refs, rows.Err()
 }
@@ -171,8 +176,33 @@ func (e *deleteForMeError) Error() string { return e.Message }
 // deleteForMeResult reports what the core did.
 type deleteForMeResult struct {
 	Deleted int
+	// MediaRemoved counts the downloaded media files removed from disk.
+	MediaRemoved int
 	// Warning is set when the patch went out but the local cleanup failed.
 	Warning string
+}
+
+// removeDownloadedMedia deletes the media files the bridge downloaded for refs.
+// The path comes from mediaDownloadStorePaths, the helper the download itself
+// uses, so it is confined to store/. A file that was never downloaded is fine.
+func removeDownloadedMedia(chatKey string, refs []storedMessageRef) int {
+	removed := 0
+	for _, ref := range refs {
+		if ref.MediaType == "" || ref.MediaType == "reaction" {
+			continue
+		}
+		_, localPath, _, err := mediaDownloadStorePaths(chatKey, ref.MediaType, ref.ID, ref.Timestamp)
+		if err != nil {
+			continue // an ID or type that can't form a store path was never downloaded
+		}
+		switch err := os.Remove(localPath); {
+		case err == nil:
+			removed++
+		case !errors.Is(err, fs.ErrNotExist):
+			fmt.Printf("Warning: failed to remove media file %s: %v\n", localPath, err)
+		}
+	}
+	return removed
 }
 
 // deleteMessagesForMe deletes ids from chatKey for this account. chatKey is the
@@ -240,6 +270,7 @@ func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *Messa
 		fmt.Printf("Warning: failed to remove deleted messages from the local store for %s: %v\n", chatKey, err)
 		result.Warning = "local store cleanup failed"
 	}
+	result.MediaRemoved = removeDownloadedMedia(chatKey, refs)
 	return result, nil
 }
 
@@ -320,6 +351,9 @@ func deleteForMeHandler(deps deleteForMeDeps, store *MessageStore) http.HandlerF
 		}
 
 		msg := fmt.Sprintf("%d message(s) deleted for me", result.Deleted)
+		if result.MediaRemoved > 0 {
+			msg += fmt.Sprintf(", %d media file(s) removed from disk", result.MediaRemoved)
+		}
 		if result.Warning != "" {
 			msg += " (" + result.Warning + ")"
 		}

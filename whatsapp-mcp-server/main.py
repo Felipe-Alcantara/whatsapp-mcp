@@ -472,8 +472,8 @@ def delete_messages_for_me(
     """Delete WhatsApp messages from this account only ("Delete for me"). IRREVERSIBLE.
 
     The messages disappear from the phone and all linked devices and are removed
-    from messages.db (media files already downloaded to disk stay). Other
-    participants keep their copies. Works for messages of any sender and any
+    from messages.db, along with the media files the bridge downloaded for them.
+    Other participants keep their copies. Works for messages of any sender and any
     age, unlike deleting for everyone.
 
     Workflow: call without confirm for a dry run and show the list to the user;
