@@ -253,6 +253,7 @@ stay deleted and the result says how many (`deleted`, `failed_batch`).
 - `chat_jid` (required): JID of the chat containing the messages
 - `after` / `before` (together): ISO-8601 half-open range `[after, before)`, e.g. `2026-10-13T00:00:00-03:00` to `2026-10-14T00:00:00-03:00` for one day. Both are required so a forgotten bound can't widen the selection to the whole chat.
 - `message_ids` (instead of a range): IDs of the messages to delete
+- `unstored_messages` (optional): messages addressed by key, `{id, from_me, timestamp}`, for messages the bridge never stored (see Limits). `timestamp` is optional ISO-8601 and only needs to be close; it can be combined with a range or `message_ids`.
 - `confirm` (optional, default `false`): must be `true` to actually delete
 
 The tool is annotated as destructive so MCP clients can ask before running it.
@@ -261,9 +262,13 @@ Failures carry a stable `error_code` (`invalid_selector`, `unknown_ids`,
 
 **Limits:**
 
-- Only messages stored in `messages.db` can be selected. The bridge keeps a
-  sample of the history and skips some message types, so a message the phone
-  still shows may be missing (`no_match`).
+- A range or `message_ids` only reach messages stored in `messages.db`. The
+  bridge keeps a sample of the history and skips some message types, so a
+  message the phone still shows may be missing (`no_match`). If you know its ID,
+  pass it in `unstored_messages` and it is deleted by key without a lookup.
+  (whatsmeow keeps the IDs of messages it decrypted in `whatsmeow_message_secrets`
+  inside `whatsapp.db`; that table is an internal detail, so the tool doesn't
+  read it for you.)
 - Group messages from other participants are not supported yet (the mutation
   needs the sender in the exact form the phone uses); your own group messages
   and all direct-chat messages are.
@@ -271,8 +276,9 @@ Failures carry a stable `error_code` (`invalid_selector`, `unknown_ids`,
   `messages.db` rows are.
 
 The bridge endpoint behind the tool is `POST /api/delete-for-me`
-(`{"chat_jid": "...", "message_ids": ["..."]}`, at most 200 IDs, bearer token
-like every other route), so other clients can reuse it directly.
+(`{"chat_jid": "...", "message_ids": ["..."], "messages": [{"id": "...", "from_me": false}]}`,
+at most 200 messages in total, bearer token like every other route), so other
+clients can reuse it directly.
 
 **Natural Language Examples:**
 

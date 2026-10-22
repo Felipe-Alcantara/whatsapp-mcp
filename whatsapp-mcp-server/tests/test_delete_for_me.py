@@ -168,6 +168,81 @@ def test_delete_messages_for_me_surfaces_bridge_error(monkeypatch):
     assert "messages not found" in msg
 
 
+# --- unstored messages (addressed by key) -----------------------------------
+
+
+def test_parse_unstored_messages_normalizes_refs():
+    refs = whatsapp.parse_unstored_messages(
+        [
+            {"id": " X1 ", "from_me": True, "timestamp": "2026-10-12T22:45:32-03:00"},
+            {"id": "X2", "timestamp": "2026-10-12T22:45:32"},
+            {"id": "X3"},
+        ]
+    )
+
+    assert refs[0] == {"id": "X1", "from_me": True, "timestamp": "2026-10-12T22:45:32-03:00"}
+    assert refs[1]["from_me"] is False
+    assert refs[1]["timestamp"][19:] != "", "a naive time must get a UTC offset: the bridge parses RFC 3339"
+    assert "timestamp" not in refs[2]
+
+
+@pytest.mark.parametrize(
+    ("raw", "fragment"),
+    [
+        ([{"from_me": True}], "non-empty id"),
+        ([{"id": "  "}], "non-empty id"),
+        ([{"id": "a", "timestamp": "yesterday"}], "Invalid timestamp"),
+        ([{"id": "a"}, {"id": "a"}], "repeat an id"),
+    ],
+)
+def test_parse_unstored_messages_rejects_bad_refs(raw, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        whatsapp.parse_unstored_messages(raw)
+
+
+def test_delete_messages_for_me_sends_explicit_refs_alongside_ids(monkeypatch):
+    calls = []
+
+    def fake_post(url, json, headers=None):
+        calls.append(json)
+        return DummyResponse()
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+    ref = {"id": "X1", "from_me": False, "timestamp": "2026-10-12T22:45:32-03:00"}
+
+    assert whatsapp.delete_messages_for_me(CHAT, [], [ref])[0] is True
+    assert whatsapp.delete_messages_for_me(CHAT, ["a2"], [ref])[0] is True
+
+    assert calls[0] == {"chat_jid": CHAT, "message_ids": [], "messages": [ref]}
+    assert calls[1] == {"chat_jid": CHAT, "message_ids": ["a2"], "messages": [ref]}
+
+
+def test_delete_messages_for_me_counts_refs_against_the_batch_limit(monkeypatch):
+    monkeypatch.setattr(whatsapp.requests, "post", lambda *a, **k: pytest.fail("bridge must not be called"))
+    refs = [{"id": f"x{i}", "from_me": False} for i in range(150)]
+
+    success, msg = whatsapp.delete_messages_for_me(CHAT, [f"m{i}" for i in range(60)], refs)
+
+    assert success is False
+    assert "At most" in msg
+
+
+def test_batched_mixes_ids_and_refs_across_requests(monkeypatch):
+    sent = []
+
+    def fake_post(url, json, headers=None):
+        sent.append((len(json["message_ids"]), len(json.get("messages", []))))
+        return DummyResponse()
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+    refs = [{"id": f"x{i}", "from_me": False} for i in range(100)]
+
+    result = whatsapp.delete_messages_for_me_batched(CHAT, [f"m{i}" for i in range(150)], unstored_messages=refs)
+
+    assert sent == [(150, 50), (0, 50)]
+    assert result["success"] is True and result["deleted"] == 250 and result["batches"] == 2
+
+
 # --- whatsapp.delete_messages_for_me_batched ---------------------------------
 
 
@@ -222,13 +297,15 @@ def _row(message_id, **overrides):
 @pytest.fixture
 def tool_calls(monkeypatch):
     """Stub the DB selection and the bridge call; record what reached the bridge."""
-    state = {"selection": [_row("a2"), _row("a3", is_from_me=True)], "deleted": []}
+    state = {"selection": [_row("a2"), _row("a3", is_from_me=True)], "deleted": [], "unstored": []}
 
     monkeypatch.setattr(main, "whatsapp_select_messages_for_deletion", lambda *a, **k: state["selection"])
 
-    def fake_delete(chat_jid, ids):
+    def fake_delete(chat_jid, ids, unstored_messages=None):
         state["deleted"].append((chat_jid, ids))
-        return {"success": True, "deleted": len(ids), "batches": 1, "message": "Messages deleted for me"}
+        state["unstored"].append(unstored_messages or [])
+        count = len(ids) + len(unstored_messages or [])
+        return {"success": True, "deleted": count, "batches": 1, "message": "Messages deleted for me"}
 
     monkeypatch.setattr(main, "whatsapp_delete_messages_for_me_batched", fake_delete)
     return state
@@ -254,7 +331,7 @@ def test_tool_confirm_deletes_exactly_the_selected_ids(tool_calls):
 
 def test_tool_reports_partial_progress_when_a_batch_fails(tool_calls, monkeypatch):
     failure = {"success": False, "deleted": 200, "batches": 1, "failed_batch": 2, "message": "Error: HTTP 503"}
-    monkeypatch.setattr(main, "whatsapp_delete_messages_for_me_batched", lambda chat_jid, ids: failure)
+    monkeypatch.setattr(main, "whatsapp_delete_messages_for_me_batched", lambda chat_jid, ids, **kwargs: failure)
 
     result = main.delete_messages_for_me(CHAT, message_ids=["a2", "a3"], confirm=True)
 
@@ -299,6 +376,60 @@ def test_tool_accepts_more_than_one_bridge_batch(tool_calls):
     assert len(tool_calls["deleted"][0][1]) == 450, "batching is the client's job, not the tool's"
 
 
+def test_tool_dry_run_flags_which_messages_are_stored(tool_calls):
+    result = main.delete_messages_for_me(
+        CHAT,
+        after="2026-10-13",
+        before="2026-10-14",
+        unstored_messages=[main.UnstoredMessage(id="x1", timestamp="2026-10-12T22:45:32-03:00")],
+    )
+
+    assert result["count"] == 3
+    assert [(m["id"], m["stored"]) for m in result["messages"]] == [("a2", True), ("a3", True), ("x1", False)]
+    assert tool_calls["deleted"] == []
+
+
+def test_tool_unstored_only_skips_the_database_lookup(tool_calls, monkeypatch):
+    monkeypatch.setattr(
+        main, "whatsapp_select_messages_for_deletion", lambda *a, **k: pytest.fail("no lookup for explicit refs")
+    )
+
+    result = main.delete_messages_for_me(
+        CHAT, unstored_messages=[main.UnstoredMessage(id="x1", from_me=True)], confirm=True
+    )
+
+    assert result == {"success": True, "deleted": 1, "message": "Messages deleted for me"}
+    assert tool_calls["deleted"] == [(CHAT, [])]
+    assert tool_calls["unstored"][0][0]["id"] == "x1" and tool_calls["unstored"][0][0]["from_me"] is True
+
+
+def test_tool_combines_a_stored_range_with_unstored_refs(tool_calls):
+    main.delete_messages_for_me(
+        CHAT,
+        after="2026-10-13",
+        before="2026-10-14",
+        unstored_messages=[main.UnstoredMessage(id="x1")],
+        confirm=True,
+    )
+
+    assert tool_calls["deleted"] == [(CHAT, ["a2", "a3"])]
+    assert [ref["id"] for ref in tool_calls["unstored"][0]] == ["x1"]
+
+
+def test_tool_rejects_an_id_that_is_both_stored_and_unstored(tool_calls):
+    result = main.delete_messages_for_me(
+        CHAT,
+        after="2026-10-13",
+        before="2026-10-14",
+        unstored_messages=[main.UnstoredMessage(id="a2")],
+        confirm=True,
+    )
+
+    assert result["error_code"] == "invalid_selector"
+    assert "a2" in result["message"]
+    assert tool_calls["deleted"] == []
+
+
 def test_tool_all_or_nothing_when_some_ids_are_unknown(tool_calls):
     result = main.delete_messages_for_me(CHAT, message_ids=["a2", "ghost"], confirm=True)
 
@@ -326,6 +457,13 @@ def test_tool_is_advertised_as_destructive_with_the_dry_run_workflow():
 
     assert tool.annotations.destructiveHint is True
     assert tool.annotations.readOnlyHint is False
-    assert set(tool.inputSchema["properties"]) == {"chat_jid", "after", "before", "message_ids", "confirm"}
+    assert set(tool.inputSchema["properties"]) == {
+        "chat_jid",
+        "after",
+        "before",
+        "message_ids",
+        "unstored_messages",
+        "confirm",
+    }
     assert tool.inputSchema["required"] == ["chat_jid"]
     assert "confirm" in tool.description and "dry run" in tool.description.lower()

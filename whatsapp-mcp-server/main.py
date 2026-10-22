@@ -6,7 +6,7 @@ from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 import media_preview
 import transcription
@@ -49,6 +49,9 @@ from whatsapp import (
 )
 from whatsapp import (
     mark_messages_read as whatsapp_mark_messages_read,
+)
+from whatsapp import (
+    parse_unstored_messages as whatsapp_parse_unstored_messages,
 )
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -433,6 +436,17 @@ def mark_messages_read(
     return {"success": success, "message": status_message}
 
 
+class UnstoredMessage(BaseModel):
+    """A message addressed by key, for messages the bridge never stored."""
+
+    id: str = Field(description="WhatsApp message ID")
+    from_me: bool = Field(default=False, description="True if this account sent the message")
+    timestamp: str | None = Field(
+        default=None,
+        description="ISO-8601 time with UTC offset; only needs to be close. Defaults to now.",
+    )
+
+
 def _delete_error(error_code: str, message: str, **extra: Any) -> dict[str, Any]:
     """A failed delete result an agent can branch on: a stable error_code plus the human message."""
     return {"success": False, "error_code": error_code, "message": message, **extra}
@@ -452,6 +466,7 @@ def delete_messages_for_me(
     after: str | None = None,
     before: str | None = None,
     message_ids: list[str] | None = None,
+    unstored_messages: list[UnstoredMessage] | None = None,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Delete WhatsApp messages from this account only ("Delete for me"). IRREVERSIBLE.
@@ -471,29 +486,44 @@ def delete_messages_for_me(
     Up to 1000 messages per call, sent to the bridge in batches of 200. Group
     messages from other participants are not supported yet.
 
-    Only messages stored in messages.db can be selected, and the bridge keeps
-    just a sample of the history: a message the phone still shows may be
-    missing here (use list_messages to check).
+    A range or message_ids only reach messages stored in messages.db, and the
+    bridge keeps just a sample of the history: a message the phone still shows
+    may be missing here (use list_messages to check). If you know the ID of such
+    a message, pass it in unstored_messages; it is addressed by key without
+    being looked up.
 
     Args:
         chat_jid: JID of the chat containing the messages
         after: Start of the range, inclusive (needs before)
         before: End of the range, exclusive (needs after)
-        message_ids: Specific message IDs to delete (instead of a range)
+        message_ids: Specific stored message IDs to delete (instead of a range)
+        unstored_messages: Messages addressed by key ({id, from_me, timestamp})
+            that the bridge never stored; can be combined with a range or ids
         confirm: Must be true to actually delete; default false is a dry run
 
     Returns:
         success and a message. A dry run adds dry_run, count and messages (id,
-        timestamp, sender, is_from_me, media_type; no text). A failure adds
-        error_code: invalid_selector, unknown_ids (with missing_ids), no_match,
-        too_many (with max) or bridge_error (with deleted, the number already
-        deleted, and failed_batch). Nothing is deleted unless success is true,
-        except after bridge_error, where earlier batches stay deleted.
+        timestamp, sender, is_from_me, media_type, stored; no text). A failure
+        adds error_code: invalid_selector, unknown_ids (with missing_ids),
+        no_match, too_many (with max) or bridge_error (with deleted, the number
+        already deleted, and failed_batch). Nothing is deleted unless success
+        is true, except after bridge_error, where earlier batches stay deleted.
     """
     try:
-        selected = whatsapp_select_messages_for_deletion(chat_jid, after, before, message_ids)
+        unstored = whatsapp_parse_unstored_messages([m.model_dump() for m in unstored_messages or []])
+        if message_ids or after or before or not unstored:
+            selected = whatsapp_select_messages_for_deletion(chat_jid, after, before, message_ids)
+        else:
+            selected = []  # only explicit refs: nothing to look up
     except ValueError as e:
         return _delete_error("invalid_selector", str(e))
+    selected = [{**m, "stored": True} for m in selected]
+    overlap = sorted({m["id"] for m in selected} & {ref["id"] for ref in unstored})
+    if overlap:
+        return _delete_error(
+            "invalid_selector",
+            f"These ids are both stored and listed in unstored_messages: {', '.join(overlap)}",
+        )
 
     if message_ids:
         found = {m["id"] for m in selected}
@@ -504,13 +534,14 @@ def delete_messages_for_me(
                 "Some message_ids are not stored for this chat; nothing was deleted",
                 missing_ids=missing,
             )
-    if not selected:
+    if not selected and not unstored:
         return _delete_error(
             "no_match",
             "No stored messages match; nothing was deleted. The bridge keeps a sample of the history, "
             "so messages the phone still shows can be missing here.",
         )
-    if len(selected) > MAX_DELETE_PER_CALL:
+    total = len(selected) + len(unstored)
+    if total > MAX_DELETE_PER_CALL:
         return _delete_error(
             "too_many",
             f"More than {MAX_DELETE_PER_CALL} messages match; narrow the range. Nothing was deleted.",
@@ -518,18 +549,32 @@ def delete_messages_for_me(
         )
 
     if not confirm:
+        listed = [
+            *selected,
+            *(
+                {
+                    "id": ref["id"],
+                    "timestamp": ref.get("timestamp"),
+                    "sender": None,
+                    "is_from_me": ref["from_me"],
+                    "media_type": None,
+                    "stored": False,
+                }
+                for ref in unstored
+            ),
+        ]
         return {
             "success": True,
             "dry_run": True,
-            "count": len(selected),
-            "messages": selected,
+            "count": total,
+            "messages": listed,
             "message": (
-                f"Dry run: {len(selected)} message(s) would be deleted for this account only. "
+                f"Dry run: {total} message(s) would be deleted for this account only. "
                 "Show this to the user, then call again with confirm=true to delete them."
             ),
         }
 
-    result = whatsapp_delete_messages_for_me_batched(chat_jid, [m["id"] for m in selected])
+    result = whatsapp_delete_messages_for_me_batched(chat_jid, [m["id"] for m in selected], unstored_messages=unstored)
     if not result["success"]:
         return _delete_error(
             "bridge_error",

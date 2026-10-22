@@ -1460,24 +1460,61 @@ def select_messages_for_deletion(
     ]
 
 
-def delete_messages_for_me(chat_jid: str, message_ids: list[str]) -> tuple[bool, str]:
+def parse_unstored_messages(raw: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Validate explicit refs for messages the bridge never stored.
+
+    Each item needs an `id`; `from_me` defaults to False; `timestamp` is optional
+    ISO-8601. WhatsApp matches the message on chat + id + direction, so the
+    timestamp only needs to be close. Returns the refs in the bridge's format.
+    """
+    refs: list[dict[str, Any]] = []
+    for item in raw or []:
+        message_id = str(item.get("id") or "").strip()
+        if not message_id:
+            raise ValueError("Every unstored message needs a non-empty id")
+        ref: dict[str, Any] = {"id": message_id, "from_me": bool(item.get("from_me", False))}
+        if item.get("timestamp"):
+            try:
+                parsed = datetime.fromisoformat(item["timestamp"])
+            except ValueError:
+                raise ValueError(f"Invalid timestamp for message {message_id}: {item['timestamp']}. Use ISO-8601.")
+            if parsed.tzinfo is None:
+                parsed = parsed.astimezone()  # the bridge wants RFC 3339, which needs an offset
+            ref["timestamp"] = parsed.isoformat()
+        refs.append(ref)
+    if len({ref["id"] for ref in refs}) != len(refs):
+        raise ValueError("Unstored messages must not repeat an id")
+    return refs
+
+
+def delete_messages_for_me(
+    chat_jid: str,
+    message_ids: list[str],
+    messages: list[dict[str, Any]] | None = None,
+) -> tuple[bool, str]:
     """Delete messages from this WhatsApp account only ("Delete for me").
 
     The messages disappear from the phone and every linked device and are
     removed from the local store. The other participants keep their copies.
+    `message_ids` are looked up in the bridge's store; `messages` are explicit
+    refs (see parse_unstored_messages) for messages it never stored.
     """
     try:
         normalized_ids = [message_id.strip() for message_id in message_ids]
+        explicit = messages or []
         if not chat_jid:
             return False, "Chat JID must be provided"
-        if not normalized_ids or any(not message_id for message_id in normalized_ids):
+        if any(not message_id for message_id in normalized_ids) or (not normalized_ids and not explicit):
             return False, "At least one non-empty message ID must be provided"
-        if len(normalized_ids) > MAX_DELETE_BATCH:
+        if len(normalized_ids) + len(explicit) > MAX_DELETE_BATCH:
             return False, f"At most {MAX_DELETE_BATCH} messages can be deleted per call"
 
+        payload: dict[str, Any] = {"chat_jid": chat_jid, "message_ids": normalized_ids}
+        if explicit:
+            payload["messages"] = explicit
         response = requests.post(
             f"{WHATSAPP_API_BASE_URL}/delete-for-me",
-            json={"chat_jid": chat_jid, "message_ids": normalized_ids},
+            json=payload,
             headers=_bridge_headers(),
         )
 
@@ -1498,9 +1535,11 @@ def delete_messages_for_me_batched(
     chat_jid: str,
     message_ids: list[str],
     batch_size: int = MAX_DELETE_BATCH,
+    unstored_messages: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Delete messages for this account in bridge-sized batches.
 
+    Stored `message_ids` go first, then the explicit `unstored_messages` refs.
     Stops at the first failing batch. Batches already sent stay deleted (the
     bridge also drops their local rows), so `deleted` is always exact and a
     retry with the same selection only covers what is left.
@@ -1509,11 +1548,14 @@ def delete_messages_for_me_batched(
         {"success", "deleted", "batches", "message"}; on failure "failed_batch"
         (1-based) tells which batch did not go through.
     """
+    items: list[str | dict[str, Any]] = [*message_ids, *(unstored_messages or [])]
     deleted = 0
     batches = 0
-    for start in range(0, len(message_ids), batch_size):
-        batch = message_ids[start : start + batch_size]
-        success, message = delete_messages_for_me(chat_jid, batch)
+    for start in range(0, len(items), batch_size):
+        batch = items[start : start + batch_size]
+        ids = [item for item in batch if isinstance(item, str)]
+        refs = [item for item in batch if not isinstance(item, str)]
+        success, message = delete_messages_for_me(chat_jid, ids, refs or None)
         if not success:
             return {
                 "success": False,

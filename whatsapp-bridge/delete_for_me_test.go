@@ -109,17 +109,37 @@ func TestBuildDeleteMessageForMePatch(t *testing.T) {
 	}
 }
 
-func TestNormalizeDeleteIDs(t *testing.T) {
-	ids, reason := normalizeDeleteIDs([]string{" a ", "b", "a"})
+func TestNormalizeDeleteRequest(t *testing.T) {
+	now := time.Unix(1760000000, 0)
+	ids, explicit, reason := normalizeDeleteRequest(DeleteForMeRequest{
+		MessageIDs: []string{" a ", "b", "a"},
+		Messages: []DeleteForMeMessage{
+			{ID: "c", FromMe: true, Timestamp: "2026-10-12T22:45:32-03:00"},
+			{ID: "d"},
+		},
+	}, now)
 	if reason != "" || strings.Join(ids, ",") != "a,b" {
-		t.Errorf("got %v %q, want [a b] with no reason", ids, reason)
+		t.Fatalf("got ids %v reason %q, want [a b] with no reason", ids, reason)
 	}
-	for name, raw := range map[string][]string{
-		"empty list":     nil,
-		"blank id":       {"a", "  "},
-		"over the limit": make([]string, maxDeleteForMeBatch+1),
-	} {
-		if _, reason := normalizeDeleteIDs(raw); reason == "" {
+	if len(explicit) != 2 || !explicit[0].FromMe || explicit[0].Timestamp.Unix() != 1791855932 {
+		t.Errorf("explicit ref c not parsed: %+v", explicit)
+	}
+	if !explicit[1].Timestamp.Equal(now) {
+		t.Errorf("a missing timestamp should default to now, got %v", explicit[1].Timestamp)
+	}
+
+	rejected := map[string]DeleteForMeRequest{
+		"nothing selected":    {},
+		"blank stored id":     {MessageIDs: []string{"a", "  "}},
+		"blank explicit id":   {Messages: []DeleteForMeMessage{{ID: " "}}},
+		"bad timestamp":       {Messages: []DeleteForMeMessage{{ID: "a", Timestamp: "yesterday"}}},
+		"id in both lists":    {MessageIDs: []string{"a"}, Messages: []DeleteForMeMessage{{ID: "a"}}},
+		"duplicate explicit":  {Messages: []DeleteForMeMessage{{ID: "a"}, {ID: "a"}}},
+		"over the limit":      {MessageIDs: make([]string, maxDeleteForMeBatch), Messages: []DeleteForMeMessage{{ID: "x"}}},
+		"limit counts blanks": {MessageIDs: make([]string, maxDeleteForMeBatch+1)},
+	}
+	for name, req := range rejected {
+		if _, _, reason := normalizeDeleteRequest(req, now); reason == "" {
 			t.Errorf("%s: expected a rejection reason", name)
 		}
 	}
@@ -250,6 +270,54 @@ func TestDeleteForMe_OwnGroupMessage_IsAllowed(t *testing.T) {
 	}
 	if idx := bridge.patches[0].Mutations[0].Index; idx[3] != "1" || idx[4] != "0" {
 		t.Errorf("own message needs fromMe=1 and participant 0, got %v", idx)
+	}
+}
+
+func TestDeleteForMe_ExplicitMessage_NeedsNoStoredRow(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	seedMessage(t, ms, "KEEP", chat, false, time.Unix(1760000000, 0))
+	bridge := connectedBridge()
+
+	resp := postJSON(t, deleteForMeHandler(bridge.deps(), ms), http.MethodPost,
+		`{"chat_jid":"`+chat+`","messages":[{"id":"UNSTORED","from_me":false,"timestamp":"2026-10-12T22:45:32-03:00"}]}`, "")
+
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "1 message(s) deleted for me") {
+		t.Fatalf("expected 200 with 1 deleted, got %d (%s)", resp.Code, resp.Body.String())
+	}
+	m := bridge.patches[0].Mutations[0]
+	if m.Index[2] != "UNSTORED" || m.Index[3] != "0" || m.Value.GetDeleteMessageForMeAction().GetMessageTimestamp() != 1791855932 {
+		t.Errorf("patch must carry the explicit key and timestamp, got %v", m.Index)
+	}
+	if n := countMessages(t, ms, chat); n != 1 {
+		t.Errorf("unrelated stored rows must be untouched, %d left", n)
+	}
+}
+
+func TestDeleteForMe_MixedStoredAndExplicit(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "15551234567@s.whatsapp.net"
+	seedMessage(t, ms, "STORED", chat, true, time.Unix(1760000000, 0))
+	bridge := connectedBridge()
+
+	resp := postJSON(t, deleteForMeHandler(bridge.deps(), ms), http.MethodPost,
+		`{"chat_jid":"`+chat+`","message_ids":["STORED"],"messages":[{"id":"UNSTORED"}]}`, "")
+
+	if resp.Code != http.StatusOK || len(bridge.patches) != 1 || len(bridge.patches[0].Mutations) != 2 {
+		t.Fatalf("expected one patch with both messages, got %d %+v", resp.Code, bridge.patches)
+	}
+	if n := countMessages(t, ms, chat); n != 0 {
+		t.Errorf("the stored row should be gone, %d left", n)
+	}
+}
+
+func TestDeleteForMe_ExplicitGroupMessageFromOthers_Returns400(t *testing.T) {
+	bridge := connectedBridge()
+	resp := postJSON(t, deleteForMeHandler(bridge.deps(), newTestMessageStore(t)), http.MethodPost,
+		`{"chat_jid":"120363012345678901@g.us","messages":[{"id":"THEIRS","from_me":false}]}`, "")
+
+	if resp.Code != http.StatusBadRequest || len(bridge.patches) != 0 {
+		t.Errorf("expected 400 and no patch, got %d (patches=%d)", resp.Code, len(bridge.patches))
 	}
 }
 

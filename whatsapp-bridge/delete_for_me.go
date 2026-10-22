@@ -34,10 +34,23 @@ import (
 // with MAX_DELETE_BATCH in whatsapp-mcp-server/whatsapp.py.
 const maxDeleteForMeBatch = 200
 
+// DeleteForMeMessage addresses a message by its key, for messages the bridge
+// never stored (history sync is partial and some message types are skipped, so
+// the phone can show messages that have no row in messages.db).
+type DeleteForMeMessage struct {
+	ID     string `json:"id"`
+	FromMe bool   `json:"from_me"`
+	// Timestamp is RFC 3339. WhatsApp matches the message on chat + ID + fromMe,
+	// so it only needs to be close; it defaults to now.
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
 // DeleteForMeRequest is the request body for the /api/delete-for-me endpoint.
+// MessageIDs are looked up in messages.db; Messages carry their own key.
 type DeleteForMeRequest struct {
-	ChatJID    string   `json:"chat_jid"`
-	MessageIDs []string `json:"message_ids"`
+	ChatJID    string               `json:"chat_jid"`
+	MessageIDs []string             `json:"message_ids,omitempty"`
+	Messages   []DeleteForMeMessage `json:"messages,omitempty"`
 }
 
 // storedMessageRef is what an app state patch needs to address a message.
@@ -165,7 +178,7 @@ type deleteForMeResult struct {
 // deleteMessagesForMe deletes ids from chatKey for this account. chatKey is the
 // storage form of the chat JID (phone JID for DMs). Validation against the
 // store is all-or-nothing and happens before any external side effect.
-func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *MessageStore, chatKey string, ids []string) (deleteForMeResult, *deleteForMeError) {
+func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *MessageStore, chatKey string, ids []string, explicit []storedMessageRef) (deleteForMeResult, *deleteForMeError) {
 	chat, err := types.ParseJID(chatKey)
 	if err != nil || chat.User == "" || chat.Server == "" {
 		return deleteForMeResult{}, &deleteForMeError{http.StatusBadRequest, "Invalid chat_jid"}
@@ -175,7 +188,7 @@ func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *Messa
 	if err != nil {
 		return deleteForMeResult{}, &deleteForMeError{http.StatusInternalServerError, fmt.Sprintf("Failed to look up messages: %v", err)}
 	}
-	refs := make([]storedMessageRef, 0, len(ids))
+	refs := make([]storedMessageRef, 0, len(ids)+len(explicit))
 	var missing []string
 	for _, id := range ids {
 		ref, ok := stored[id]
@@ -183,15 +196,21 @@ func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *Messa
 			missing = append(missing, id)
 			continue
 		}
-		if chat.Server == types.GroupServer && !ref.FromMe {
-			// The participant slot of the mutation index needs the sender in the
-			// form the phone uses (PN or LID), which is not verified yet.
-			return deleteForMeResult{}, &deleteForMeError{http.StatusBadRequest, "deleting other participants' group messages is not supported yet"}
-		}
 		refs = append(refs, ref)
 	}
 	if len(missing) > 0 {
 		return deleteForMeResult{}, &deleteForMeError{http.StatusNotFound, fmt.Sprintf("messages not found in chat: %s", strings.Join(missing, ", "))}
+	}
+	refs = append(refs, explicit...)
+
+	if chat.Server == types.GroupServer {
+		for _, ref := range refs {
+			if !ref.FromMe {
+				// The participant slot of the mutation index needs the sender in
+				// the form the phone uses (PN or LID), which is not verified yet.
+				return deleteForMeResult{}, &deleteForMeError{http.StatusBadRequest, "deleting other participants' group messages is not supported yet"}
+			}
+		}
 	}
 
 	if !deps.isConnected() {
@@ -209,8 +228,14 @@ func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *Messa
 		return deleteForMeResult{}, &deleteForMeError{http.StatusInternalServerError, fmt.Sprintf("Failed to delete messages: %v", err)}
 	}
 
+	// An explicit ref may still have a row (the caller can mix both forms), so
+	// clean up every ID; deleting a row that isn't there is a no-op.
+	allIDs := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		allIDs = append(allIDs, ref.ID)
+	}
 	result := deleteForMeResult{Deleted: len(refs)}
-	if err := store.DeleteMessages(chatKey, ids); err != nil {
+	if err := store.DeleteMessages(chatKey, allIDs); err != nil {
 		// The patch already went out; report it rather than failing the call.
 		fmt.Printf("Warning: failed to remove deleted messages from the local store for %s: %v\n", chatKey, err)
 		result.Warning = "local store cleanup failed"
@@ -218,28 +243,50 @@ func deleteMessagesForMe(ctx context.Context, deps deleteForMeDeps, store *Messa
 	return result, nil
 }
 
-// normalizeDeleteIDs trims and de-duplicates ids, keeping their order. The
-// returned string is a client-facing reason when the list is unusable.
-func normalizeDeleteIDs(raw []string) ([]string, string) {
-	if len(raw) == 0 {
-		return nil, "chat_jid and message_ids are required"
+// normalizeDeleteRequest validates the message selection of a request: it trims
+// and de-duplicates the stored IDs (keeping their order) and turns the explicit
+// messages into refs. The returned string is a client-facing reason when the
+// selection is unusable.
+func normalizeDeleteRequest(req DeleteForMeRequest, now time.Time) ([]string, []storedMessageRef, string) {
+	if len(req.MessageIDs)+len(req.Messages) == 0 {
+		return nil, nil, "message_ids or messages are required"
 	}
-	if len(raw) > maxDeleteForMeBatch {
-		return nil, fmt.Sprintf("at most %d message_ids per request", maxDeleteForMeBatch)
+	if len(req.MessageIDs)+len(req.Messages) > maxDeleteForMeBatch {
+		return nil, nil, fmt.Sprintf("at most %d messages per request", maxDeleteForMeBatch)
 	}
-	ids := make([]string, 0, len(raw))
-	seen := make(map[string]bool, len(raw))
-	for _, id := range raw {
+	ids := make([]string, 0, len(req.MessageIDs))
+	seen := make(map[string]bool, len(req.MessageIDs)+len(req.Messages))
+	for _, id := range req.MessageIDs {
 		id = strings.TrimSpace(id)
 		if id == "" {
-			return nil, "message_ids must not contain empty values"
+			return nil, nil, "message_ids must not contain empty values"
 		}
 		if !seen[id] {
 			seen[id] = true
 			ids = append(ids, id)
 		}
 	}
-	return ids, ""
+	explicit := make([]storedMessageRef, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			return nil, nil, "messages must not contain an empty id"
+		}
+		if seen[id] {
+			return nil, nil, fmt.Sprintf("message %q is listed more than once", id)
+		}
+		seen[id] = true
+		ts := now
+		if m.Timestamp != "" {
+			parsed, err := time.Parse(time.RFC3339, m.Timestamp)
+			if err != nil {
+				return nil, nil, fmt.Sprintf("timestamp of message %q must be RFC 3339", id)
+			}
+			ts = parsed
+		}
+		explicit = append(explicit, storedMessageRef{ID: id, Timestamp: ts, FromMe: m.FromMe})
+	}
+	return ids, explicit, ""
 }
 
 func deleteForMeHandler(deps deleteForMeDeps, store *MessageStore) http.HandlerFunc {
@@ -255,17 +302,17 @@ func deleteForMeHandler(deps deleteForMeDeps, store *MessageStore) http.HandlerF
 			return
 		}
 		if req.ChatJID == "" {
-			http.Error(w, "chat_jid and message_ids are required", http.StatusBadRequest)
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
 			return
 		}
-		ids, reason := normalizeDeleteIDs(req.MessageIDs)
+		ids, explicit, reason := normalizeDeleteRequest(req, time.Now())
 		if reason != "" {
 			http.Error(w, reason, http.StatusBadRequest)
 			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		result, derr := deleteMessagesForMe(context.Background(), deps, store, req.ChatJID, ids)
+		result, derr := deleteMessagesForMe(context.Background(), deps, store, req.ChatJID, ids, explicit)
 		if derr != nil {
 			w.WriteHeader(derr.Status)
 			_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: derr.Message})
